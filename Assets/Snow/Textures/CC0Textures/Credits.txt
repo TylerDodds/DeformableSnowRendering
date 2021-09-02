@@ -1,0 +1,3 @@
+Contains assets from CC0Textures.com, licensed under CC0 1.0 Universal.
+
+See https://docs.cc0textures.com/licensing.html

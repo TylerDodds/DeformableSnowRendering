@@ -1,0 +1,530 @@
+// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: (c) 2021 Tyler Dodds
+
+#pragma multi_compile_local __ SIMULATE_VELOCITY
+
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel SimpleDisplacement
+#pragma kernel HeightMinimum
+#pragma kernel HeightMinimumWithFalloffMask
+#pragma kernel HeightAboveOneSpread
+#pragma kernel VelocityClear
+#pragma kernel VelocityUpdateSimple
+#pragma kernel VelocityDecode
+#pragma kernel HeightEncode
+#pragma kernel SweepArea
+
+//NB These ranges are chosen somewhat conservatively to encode both height in [0, 1] and velocity in texel/second. We don't need to fully maximize the resulting precision.
+#include "EncodingCommon.hlsl"
+
+struct VelocityDataEncoded
+{
+	//NB Note these need to be int or uint so that we can use atomic functions.
+	int VelocityWeightedByHeightX;
+	int VelocityWeightedByHeightY;
+	int HeightAmount;
+};
+
+struct VelocityData
+{
+	//NB Although these would ideally be smaller footprint than floating-point precision, the need for 32-bit values in the encoded velocity structure means such a savings is fairly negligible.
+	float2 Velocity;//NB Stored in px/second
+	float HeightAmount;
+};
+
+VelocityData ZeroVelocityHeight()
+{
+	VelocityData velocityData;
+	velocityData.Velocity = float2(0, 0);
+	velocityData.HeightAmount = 0;
+	return velocityData;
+}
+
+VelocityDataEncoded ZeroVelocityHeightEncoded()
+{
+	VelocityDataEncoded velocityDataEncoded;
+	velocityDataEncoded.VelocityWeightedByHeightX = 0;
+	velocityDataEncoded.VelocityWeightedByHeightY = 0;
+	velocityDataEncoded.HeightAmount = 0;
+	return velocityDataEncoded;
+}
+
+int2 EncodeVelocity(float2 velocity)
+{
+	return int2(EncodeFloatAsInt(velocity.x), EncodeFloatAsInt(velocity.y));
+}
+
+float2 DecodeVelocity(int2 velocity)
+{
+	return float2(DecodeIntToFloat(velocity.x), DecodeIntToFloat(velocity.y));
+}
+
+#if defined(SIMULATE_VELOCITY)
+
+VelocityDataEncoded EncodeVelocityData(VelocityData vd)
+{
+	VelocityDataEncoded vde;
+	int2 encodedVelocity = EncodeVelocity(vd.Velocity);
+	vde.VelocityWeightedByHeightX = encodedVelocity.x;
+	vde.VelocityWeightedByHeightY = encodedVelocity.y;
+	vde.HeightAmount = EncodeHeight(vd.HeightAmount);
+	return vde;
+}
+
+VelocityData DecodeVelocityDataToFloats(VelocityDataEncoded vde)
+{
+	VelocityData vd;
+	vd.Velocity = DecodeVelocity(int2(vde.VelocityWeightedByHeightX, vde.VelocityWeightedByHeightY));
+	vd.HeightAmount = DecodeHeight(vde.HeightAmount);
+	return vd;
+}
+
+VelocityData DecodeAndResolveVelocityData(VelocityDataEncoded vde)
+{
+	VelocityData decoded = DecodeVelocityDataToFloats(vde);
+	if (decoded.HeightAmount > 0)
+	{
+		decoded.Velocity /= decoded.HeightAmount;
+	}
+	else
+	{
+		decoded = ZeroVelocityHeight();
+	}
+	return decoded;
+}
+
+RWStructuredBuffer<VelocityDataEncoded> VelocityComputeBufferEncodedReadWrite;
+RWStructuredBuffer<VelocityData> VelocityComputeBufferFloatReadWrite;
+StructuredBuffer<VelocityDataEncoded> VelocityComputeBufferEncodedRead;
+StructuredBuffer<VelocityData> VelocityComputeBufferFloatRead;
+
+void AddVelocityData(uint velocityIndex, float heightAmount, float2 velocity)
+{
+	int2 encodedVelocity = EncodeVelocity(heightAmount * velocity);
+	int encodedHeight = EncodeHeight(heightAmount);
+	InterlockedAdd(VelocityComputeBufferEncodedReadWrite[velocityIndex].HeightAmount, encodedHeight);
+	InterlockedAdd(VelocityComputeBufferEncodedReadWrite[velocityIndex].VelocityWeightedByHeightX, encodedVelocity.x);
+	InterlockedAdd(VelocityComputeBufferEncodedReadWrite[velocityIndex].VelocityWeightedByHeightY, encodedVelocity.y);
+}
+#endif
+
+RWBuffer<int> HeightComputeBufferEncodedReadWrite;
+void AddHeight(uint bufferIndex, float heightAmount)
+{
+	int encodedHeight = EncodeHeight(heightAmount);
+	InterlockedAdd(HeightComputeBufferEncodedReadWrite[bufferIndex], encodedHeight);
+}
+
+Texture2D<float> MaskHeightTexture;
+
+Texture2D<float> CurrentHeightTexture;
+Texture2D<float4> CameraMotionVectorsTexture;
+Texture2D<float2> HorizontalGradientTexture;
+Texture2D<float> FalloffMaskTexture;
+
+//For swept area
+RWTexture2D<float> CurrentHeightTextureRW;
+RWTexture2D<float4> CameraMotionVectorsTextureRW;
+
+SamplerState linearClampSampler;
+
+float FrameTime;
+float4 TextureSize;
+float TexelsPerMeter;
+float ReversedZAmount;
+float4 SpeedScaleOffset_GradientFractionalPowerScale;
+float4 Jitter;
+float4 HalfLife_HeightSpread_Decay_Block;
+float4 HeightDecay_Reference_Magnitude_PowerLowHigh;
+float4 VelocityDecay_Reference_Magnitude_PowerLowHigh;
+
+uint GetBufferIndex(uint2 id)
+{
+	return id.x + TextureSize.x * id.y;
+}
+
+float2 GetUv(float2 idf)
+{
+	float2 uv = (idf + 0.5) * TextureSize.zw;
+	return uv;
+}
+
+float2 GetUv(uint3 id)
+{
+	float2 uv = (id.xy + 0.5) * TextureSize.zw;
+	return uv;
+}
+
+bool OutsideBounds(uint3 id)
+{
+	return id.x + 0.5 > TextureSize.x || id.y + 0.5 > TextureSize.y;
+}
+
+float GetDepth01(float2 localTexcoord, Texture2D<float> depthTex)
+{
+	//See related notes in layer mask update shader.
+	float2 sampleUv = float2(1 - localTexcoord.x, localTexcoord.y);
+	float depthTexValue = depthTex.SampleLevel(linearClampSampler, sampleUv, 0);
+	float depth01 = depthTexValue;
+	return lerp(depth01, 1.0 - depth01, ReversedZAmount);
+}
+
+float2 GetHorizontalSurfaceOutwardFacingVector(float2 uv)
+{
+	float2 approximateHorizontalNormal = HorizontalGradientTexture.SampleLevel(linearClampSampler, uv, 0);
+	return approximateHorizontalNormal;
+}
+
+[numthreads(8,8,1)]
+void SimpleDisplacement (uint3 id : SV_DispatchThreadID)
+{
+	if (OutsideBounds(id))
+		return;
+
+	float2 uv = GetUv(id);
+	float2 horizontalReversedUvs = float2(1 - uv.x, uv.y);
+
+	float currentHeight = GetDepth01(uv, CurrentHeightTexture);
+
+	if (currentHeight < 1)
+	{
+		float prevMaskHeight = MaskHeightTexture[id.xy];
+		float heightDifference = max(0, prevMaskHeight - currentHeight);
+
+		float4 rawMotionVectors = CameraMotionVectorsTexture.SampleLevel(linearClampSampler, horizontalReversedUvs, 0);
+		float2 horizontalMotionVectors = float2(-rawMotionVectors.x, rawMotionVectors.y);
+
+		float2 horizontalOutwardVector = GetHorizontalSurfaceOutwardFacingVector(uv);
+		float horizontalOutwardVectorLength = length(horizontalOutwardVector);
+		float2 horizontalOutwardNormal = horizontalOutwardVectorLength == 0 ? float2(0, 0) : horizontalOutwardVector / horizontalOutwardVectorLength;
+		float horizontalOutwardVectorStrength = pow(saturate(horizontalOutwardVectorLength * SpeedScaleOffset_GradientFractionalPowerScale.w), SpeedScaleOffset_GradientFractionalPowerScale.z);
+
+		//Motion vectors are either in clip space [-1, 1] or NDC [0, 1]. Based on the SweepArea kernel results, they are likely to be in NDC.
+		float2 motionAmountInPx = horizontalMotionVectors * TextureSize.xy;
+		float motionAmountMagnitude = length(motionAmountInPx);
+		float2 motionAmountDirection = motionAmountMagnitude == 0 ? float2(0, 0) : motionAmountInPx / motionAmountMagnitude;
+		float motionAmountMagnitudeAltered = (SpeedScaleOffset_GradientFractionalPowerScale.y + SpeedScaleOffset_GradientFractionalPowerScale.x * motionAmountMagnitude);
+
+		//Alter direction, speed based on horizontalNormal
+		float directionGradientDot = saturate(dot(motionAmountDirection, horizontalOutwardNormal));
+		float horizontalAmount = horizontalOutwardVectorStrength * directionGradientDot;
+		float2 motionAlongOutwardVector = horizontalOutwardNormal * horizontalAmount * motionAmountMagnitudeAltered;
+		float2 motionAlongMotionVector = motionAmountDirection * motionAmountMagnitudeAltered * (1.0 - horizontalOutwardVectorStrength);
+		float2 combinedMotion = motionAlongMotionVector + motionAlongOutwardVector;
+
+		float2 idWithMotion = combinedMotion + id.xy + Jitter.xy;
+		uint2 idWithMotionFloor = floor(idWithMotion);
+		float2 fractionalId = idWithMotion - idWithMotionFloor;
+
+		float heightAddedTotal = 0;
+
+		#if defined(SIMULATE_VELOCITY)
+		float2 displacementVelocity = motionAmountInPx / FrameTime;//NB Applying offset or scaled motion to velocity will tend to look artificially high, so we use the base motion amount instead.
+		#endif
+
+		[unroll]
+		for (uint i = 0; i <= 1; i++)
+		{
+			[unroll]
+			for (uint j = 0; j <= 1; j++)
+			{
+				uint2 ij = uint2(i, j);
+				uint2 idm = idWithMotionFloor + ij;
+				if (all(idm > (uint)0) && all(idm < (uint2)TextureSize.xy))
+				{
+					float2 pixelCoverageFractions = (uint2(1, 1) - ij) * (float2(1, 1) - fractionalId) + ij * fractionalId;
+					float coverageFraction = pixelCoverageFractions.x * pixelCoverageFractions.y;//Note that this fraction adds to 1 over the four neighbours
+					float heightAddition = heightDifference * coverageFraction;
+					uint idmBufferIndex = GetBufferIndex(idm);
+					AddHeight(idmBufferIndex, heightAddition);
+					heightAddedTotal += heightAddition;
+					#if defined(SIMULATE_VELOCITY)
+					AddVelocityData(idmBufferIndex, heightAddition, displacementVelocity);
+					#endif
+				}
+			}
+		}
+		#if defined(SIMULATE_VELOCITY)
+		uint velocityIndex = GetBufferIndex(id.xy);
+		AddVelocityData(velocityIndex, -heightAddedTotal, displacementVelocity);
+		#endif
+		//Need to subtract this amount to keep overall volume the same, since prevMaskHeight can now be > 1, so 'empty' areas with currentHeight == 1 will see a positive heightDifference, therefore spreading results potentially to neighbours.
+		AddHeight(GetBufferIndex(id.xy), -heightAddedTotal);
+	}
+}
+
+float GetMinimumWithHeightIn01(float previousValue, float heightIn01)
+{
+	float value = previousValue;
+	if (heightIn01 < 1)
+	{
+		value = min(heightIn01, previousValue);
+	}
+	return max(0, value);
+}
+
+[numthreads(8, 8, 1)]
+void HeightMinimum(uint3 id : SV_DispatchThreadID)
+{
+	if (OutsideBounds(id))
+		return;
+
+	float2 uv = GetUv(id);
+
+	float prevMaskHeight = DecodeHeight(HeightComputeBufferEncodedReadWrite[GetBufferIndex(id.xy)]);
+	float currentHeight = GetDepth01(uv, CurrentHeightTexture);
+
+	uint bufferIndex = GetBufferIndex(id.xy);
+	HeightComputeBufferEncodedReadWrite[bufferIndex] = EncodeHeight(GetMinimumWithHeightIn01(prevMaskHeight, currentHeight));
+
+	#if defined(SIMULATE_VELOCITY)
+	VelocityDataEncoded encoded = VelocityComputeBufferEncodedReadWrite[bufferIndex];
+	VelocityData decoded = DecodeAndResolveVelocityData(encoded);
+	encoded.HeightAmount = EncodeHeight(GetMinimumWithHeightIn01(decoded.HeightAmount, currentHeight));
+	VelocityComputeBufferEncodedReadWrite[bufferIndex] = encoded;
+	#endif
+}
+
+[numthreads(8, 8, 1)]
+void HeightMinimumWithFalloffMask(uint3 id : SV_DispatchThreadID)
+{
+	if (OutsideBounds(id))
+		return;
+
+	float2 uv = GetUv(id);
+
+	float prevMaskHeight = DecodeHeight(HeightComputeBufferEncodedReadWrite[GetBufferIndex(id.xy)]);
+
+	float currentHeight = GetDepth01(uv, CurrentHeightTexture);
+	float falloffMask = FalloffMaskTexture.SampleLevel(linearClampSampler, uv, 0);
+
+	float minFalloffCurrent = min(currentHeight, falloffMask);
+	uint bufferIndex = GetBufferIndex(id.xy);
+	HeightComputeBufferEncodedReadWrite[bufferIndex] = EncodeHeight(GetMinimumWithHeightIn01(prevMaskHeight, minFalloffCurrent));
+
+	#if defined(SIMULATE_VELOCITY)
+	VelocityDataEncoded encoded = VelocityComputeBufferEncodedReadWrite[bufferIndex];
+	VelocityData decoded = DecodeAndResolveVelocityData(encoded);
+	encoded.HeightAmount = EncodeHeight(GetMinimumWithHeightIn01(decoded.HeightAmount, minFalloffCurrent));
+	VelocityComputeBufferEncodedReadWrite[bufferIndex] = encoded;
+	#endif
+}
+
+//NB For exponential decay, position ~ A Exp(-ln(2) t / T), so the velocity is -(ln(2)/T) * position, and acceleration is -(ln(2)/T) * velocity. So velocity after dt is v(1 - dt ln(2) / T).
+float GetExponentialDecayFractionLoss(float frameTime, float halfLife)
+{
+	return 0.69314718056 * frameTime / halfLife;
+}
+
+float GetExponentialDecayFraction(float frameTime, float halfLife)
+{
+	return 1.0 - GetExponentialDecayFractionLoss(frameTime, halfLife);
+}
+
+
+[numthreads(8, 8, 1)]
+void HeightAboveOneSpread(uint3 id : SV_DispatchThreadID)
+{
+	if (OutsideBounds(id))
+		return;
+
+	float2 uv = GetUv(id);
+
+	float prevMaskHeight = MaskHeightTexture[id.xy];
+
+
+	if (prevMaskHeight > 1)
+	{
+		float difference = (prevMaskHeight - 1.0);
+		uint bufferIndex = GetBufferIndex(id.xy);
+
+		const float decayHalfLife = HalfLife_HeightSpread_Decay_Block.y;
+		const float decayFraction = GetExponentialDecayFractionLoss(FrameTime, decayHalfLife);
+		const float decayAmount = difference * decayFraction;
+		difference -= decayAmount;
+
+		const float spreadHalfLife = HalfLife_HeightSpread_Decay_Block.x;
+		const float spreadFraction = GetExponentialDecayFractionLoss(FrameTime, spreadHalfLife);
+		const float denominator = (4.0 + 4.0 / sqrt(2.0)) / spreadFraction;
+
+		#if defined(SIMULATE_VELOCITY)
+		VelocityDataEncoded encoded = VelocityComputeBufferEncodedReadWrite[bufferIndex];
+		VelocityData decoded = DecodeAndResolveVelocityData(encoded);
+		float2 baseVelocity = decoded.Velocity;
+		#endif
+
+		float totalHeightAdded = decayAmount;//Start with decayAmount here, so it'll be subtracted at the end also
+		[unroll]
+		for (int i = -1; i <= 1; i++)
+		{
+			[unroll]
+			for (int j = -1; j <= 1; j++)
+			{
+				int2 ij = int2(i, j);
+				int2 idm = id.xy + ij;
+				if (all(idm > 0) && all(idm < (int2)TextureSize.xy))
+				{
+					if (any(ij))
+					{
+						float heightToAdd = difference / (length(ij) * denominator);
+						totalHeightAdded += heightToAdd;
+						uint idmBufferIndex = GetBufferIndex(idm);
+						AddHeight(idmBufferIndex, heightToAdd);
+						#if defined(SIMULATE_VELOCITY)
+						AddVelocityData(idmBufferIndex, heightToAdd, baseVelocity);
+						#endif
+					}
+				}
+			}
+		}
+		AddHeight(bufferIndex, -totalHeightAdded);
+		#if defined(SIMULATE_VELOCITY)
+		AddVelocityData(bufferIndex, -totalHeightAdded, baseVelocity);
+		#endif
+
+	}
+}
+
+
+[numthreads(8, 8, 1)]
+void VelocityClear(uint3 id : SV_DispatchThreadID)
+{
+	#if defined(SIMULATE_VELOCITY)
+	if (OutsideBounds(id))
+		return;
+	uint velocityIndex = GetBufferIndex(id.xy);
+	VelocityComputeBufferEncodedReadWrite[velocityIndex] = ZeroVelocityHeightEncoded();
+	#endif
+}
+
+//NB To more generally parameterize decay curves, v = v_R[c*a*t/v_R + D]^(-1/a) => v' = -c(v/v_R)^(1+a), where D = (v_0/v_R)^(-a), for a != 0.
+float GetGeneralDecayPositiveParameterValue(float parameter, float frameTime, float speedFactor, float referenceValue, float2 decayPowers)
+{
+	float decayPower = lerp(decayPowers.x, decayPowers.y, step(referenceValue, parameter));
+	return max(0, parameter - frameTime * speedFactor * pow(abs(parameter / referenceValue), 1 + decayPower));
+}
+
+float2 GetGeneralDecayNewVelocityValue(float2 velocity, float frameTime, float speedFactor, float referenceSpeed, float2 decayPowers)
+{
+	float speed = length(velocity);
+	float2 direction = speed == 0 ? float2(0, 0) : velocity / speed;
+	float finalSpeed = GetGeneralDecayPositiveParameterValue(speed, frameTime, speedFactor, referenceSpeed, decayPowers);
+	return finalSpeed * direction;
+}
+
+[numthreads(8, 8, 1)]
+void VelocityUpdateSimple(uint3 id : SV_DispatchThreadID)
+{
+	#if defined(SIMULATE_VELOCITY)
+	if (OutsideBounds(id))
+		return;
+
+	const float heightEpsilon = 0.001;
+	const float velocityEpsilon = 0.001;
+	const float blockHalfLife = HalfLife_HeightSpread_Decay_Block.z;
+
+	uint velocityIndex = GetBufferIndex(id.xy);
+
+	VelocityData prevVelocityData = VelocityComputeBufferFloatRead[velocityIndex];
+	VelocityData updatedVelocityData;
+
+	float prevHeight = MaskHeightTexture[id.xy];
+	float prevHeightAboveOne = max(0, prevHeight - 1.0);
+	updatedVelocityData.HeightAmount = GetGeneralDecayPositiveParameterValue(prevVelocityData.HeightAmount, FrameTime, HeightDecay_Reference_Magnitude_PowerLowHigh.y, HeightDecay_Reference_Magnitude_PowerLowHigh.x, HeightDecay_Reference_Magnitude_PowerLowHigh.zw);//Decrease the height being moved over time (so some snow 'sticks' where it ends up).
+	updatedVelocityData.HeightAmount += max(updatedVelocityData.HeightAmount - prevHeight, 0) * FrameTime * 0.8;//Also add velocity to some of the existing height (picking up some snow along the way).
+	float amountToIncludeHeightAboveOne = max(prevHeightAboveOne - updatedVelocityData.HeightAmount, 0);
+	updatedVelocityData.HeightAmount += amountToIncludeHeightAboveOne;
+
+	const float baseSpeedFactor = VelocityDecay_Reference_Magnitude_PowerLowHigh.y;
+	const float speedFactor = baseSpeedFactor * lerp(1, 0.2, saturate(5.0 * sqrt(amountToIncludeHeightAboveOne)));//Limit the slowdown based on any additional height above one.
+	updatedVelocityData.Velocity = GetGeneralDecayNewVelocityValue(prevVelocityData.Velocity, FrameTime, speedFactor, VelocityDecay_Reference_Magnitude_PowerLowHigh.x * (TexelsPerMeter / 100.0), VelocityDecay_Reference_Magnitude_PowerLowHigh.zw);//We generally want a stronger decrease at 'higher' velocities, and lower decrease at slow velocities, so we'll use a higher power of velocity.
+
+	float updatedSpeed = length(updatedVelocityData.Velocity);
+	float heightAddedTotal = 0;
+	if (updatedVelocityData.HeightAmount > heightEpsilon && updatedSpeed > velocityEpsilon)
+	{
+		float2 idWithMotion = updatedVelocityData.Velocity * FrameTime + id.xy;
+		uint2 idWithMotionFloor = floor(idWithMotion);
+		float2 fractionalId = idWithMotion - idWithMotionFloor;
+		float heightAmount = updatedVelocityData.HeightAmount;
+		float2 uvWithMotion = GetUv(idWithMotion);
+		float maskHeightAtMotionFinal = MaskHeightTexture.SampleLevel(linearClampSampler, uvWithMotion, 0);
+		float heightDifference = max(0, maskHeightAtMotionFinal - prevHeight);
+		float heightAmountBlocked = min(heightAmount, heightDifference);
+		heightAmount -= heightAmountBlocked * GetExponentialDecayFractionLoss(FrameTime, blockHalfLife);
+		[unroll]
+		for (uint i = 0; i <= 1; i++)
+		{
+			[unroll]
+			for (uint j = 0; j <= 1; j++)
+			{
+				uint2 ij = uint2(i, j);
+				uint2 idm = idWithMotionFloor + ij;
+				if (all(idm > (uint)0) && all(idm < (uint2)TextureSize.xy))
+				{
+					uint idmVelocityIndex = GetBufferIndex(idm);
+					float2 pixelCoverageFractions = (uint2(1, 1) - ij) * (float2(1, 1) - fractionalId) + ij * fractionalId;
+					float coverageFraction = pixelCoverageFractions.x * pixelCoverageFractions.y;//Note that this fraction adds to 1 over the four neighbours
+					float heightAddition = heightAmount * coverageFraction;
+					
+					AddVelocityData(idmVelocityIndex, heightAddition, updatedVelocityData.Velocity);
+					
+					heightAddedTotal += heightAddition;
+					AddHeight(idmVelocityIndex, heightAddition);
+				}
+			}
+		}
+		AddHeight(velocityIndex, -heightAddedTotal);
+	}
+
+	#endif
+}
+
+[numthreads(8, 8, 1)]
+void VelocityDecode(uint3 id : SV_DispatchThreadID)
+{
+#if defined(SIMULATE_VELOCITY)
+	if (OutsideBounds(id))
+		return;
+	uint velocityIndex = GetBufferIndex(id.xy);
+	VelocityDataEncoded encoded = VelocityComputeBufferEncodedRead[velocityIndex];
+	VelocityData decoded = DecodeAndResolveVelocityData(encoded);
+	VelocityComputeBufferFloatReadWrite[velocityIndex] = decoded;
+#endif
+}
+
+[numthreads(8, 8, 1)]
+void HeightEncode(uint3 id : SV_DispatchThreadID)
+{
+	if (OutsideBounds(id))
+		return;
+	uint bufferIndex = GetBufferIndex(id.xy);
+	float decoded = MaskHeightTexture[id.xy];
+	int encoded = EncodeHeight(decoded);
+	HeightComputeBufferEncodedReadWrite[bufferIndex] = encoded;
+}
+
+#include "LineRasterizing.hlsl"
+
+[numthreads(8, 8, 1)]
+void SweepArea(uint3 id : SV_DispatchThreadID)
+{
+	if (OutsideBounds(id))
+		return;
+
+	float2 uv = GetUv(id);
+	float2 horizontalReversedUvs = float2(1 - uv.x, uv.y);
+	uint2 horizontalReversedId = uint2(TextureSize.x - 1 - id.x, id.y);
+	
+	float depth01 = CurrentHeightTextureRW[horizontalReversedId];
+	float currentHeight = lerp(depth01, 1.0 - depth01, ReversedZAmount);
+	if (currentHeight < 1)
+	{
+		float4 rawMotionVectors = CameraMotionVectorsTexture.SampleLevel(linearClampSampler, horizontalReversedUvs, 0);
+		float2 horizontalMotionVectors = float2(-rawMotionVectors.x, rawMotionVectors.y);
+		float2 motionAmountInPx = horizontalMotionVectors * TextureSize.xy;
+
+		uint2 prevId = round(id.xy - motionAmountInPx);
+		RasterizeLine(id.x, id.y, prevId.x, prevId.y, depth01, currentHeight, rawMotionVectors);
+	}
+}
