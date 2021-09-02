@@ -489,19 +489,28 @@ As a side note, it seems that we need to choose the inverted y direction when de
 
 ## Version Update
 
-### 2020.3
+### 2020.3 Changes
 
 We will update to use Unity 2020.3.6f1 with HDRP 10.4.0, so that we can take advantage of correctly-rendered motion vectors when we perform our simulation.
 
-Fortunately, none of our material, shader, or Custom Render Texture setup needs to change. Only the `CustomPass` API has changed slightly. First, we must update the `Execute` function; the new API combines all parameters into a `CustomPassContext` instance.
+Fortunately, none of our material, shader, or Custom Render Texture setup needs to change. 
 
-Second, we must change how we perform baking to our non-rendered orthographic cameras. We'll change from the deprecated `HDUtils.DrawRendererList` to `CoreUtils.DrawRendererList`. However, much of the updating of camera parameters now happens under the hood in HDRP, so we cannot simply set those values directly via the command buffer. With [`CustomPassUtils`](https://github.com/Unity-Technologies/Graphics/blob/f68f31c838aab006080ec196f12a856e868033f5/com.unity.render-pipelines.high-definition/Runtime/RenderPipeline/RenderPass/CustomPass/CustomPassUtils.cs), we could use `RenderWithCamera` or similar functions. However, to more directly keep the behaviour of our `DrawRendererList` calls, we'll keep those, but use the `HDRenderPipeline.OverrideCameraRendering` struct, which sets the appropriate camera parameters.
+Note that we can set any Injection Point for our Custom Pass Volume, so we can choose Before Rendering. As a result, we'll revisit our use of CustomRenderTextures, instead performing all the updates within this CustomPass using `CoreUtils.DrawFullScreen`, so that results are available in the same frame. To do this, we'll need to make another version of our layer mask and detail normal shaders that use the CustomPass vertex shader setup, instead of the CustomRenderTexture one.
 
-Note that this struct is currently internal, and will set the baking camera's aspect ratio to match the rendered camera's. We'll need to make slight modifications to the HDRP package to make it public and give the option of not changing the aspect ratio. To do this, simply copy the package into the Unity Project's Packages folder, where it will be found as an embedded package, and used instead of the cached version. We can safely make project-only changes to the source code of this copy.
+The only API change we need to consider is a small one in `CustomPass`. First, we must update the `Execute` function; the new API combines all parameters into a `CustomPassContext` instance.
 
-We still can (and need to) set the `unity_MatrixVP` value via the command buffer, so that our depth write shader (which uses default behaviour for vertex transformations, not those of the scriptable render pipelines) will work as before.
+Second, we still can (and need to) set the `unity_MatrixVP` value via the command buffer, so that our depth write shader (which uses default behaviour for vertex transformations, not those of the scriptable render pipelines) will work as before.
 
-Finally, we'll note that we can set any Injection Point for our Custom Pass Volume, so we can choose Before Rendering. As a result, we'll revisit our use of CustomRenderTextures, instead performing all the updates within this CustomPass using `CoreUtils.DrawFullScreen`, so that results are available in the same frame. To do this, we'll need to make another version of our layer mask and detail normal shaders that use the CustomPass vertex shader setup, instead of the CustomRenderTexture one.
+Third, we must change how we perform baking to our non-rendered orthographic cameras. We'll change from the deprecated `HDUtils.DrawRendererList` to `CoreUtils.DrawRendererList`. However, much of the updating of camera parameters now happens under the hood in HDRP, so we cannot simply set those values directly via the command buffer. With [`CustomPassUtils`](https://github.com/Unity-Technologies/Graphics/blob/f68f31c838aab006080ec196f12a856e868033f5/com.unity.render-pipelines.high-definition/Runtime/RenderPipeline/RenderPass/CustomPass/CustomPassUtils.cs), we could use `RenderWithCamera` or similar functions. However, to more directly keep the behaviour of our `DrawRendererList` calls, we'll keep those, but use the `HDRenderPipeline.OverrideCameraRendering` struct, which sets the appropriate camera parameters.
+
+Note that this struct is currently internal, and will set the baking camera's aspect ratio to match the rendered camera's. We'll need to make slight modifications to the HDRP package to make it public and give the option of not changing the aspect ratio. 
+
+### HDRP Package Modification Instructions
+
+To use a modified version of the HDRP package, simply copy the package (from Library/PackageCache) into the Unity Project's Packages folder, where it will be found as an embedded package, and used instead of the cached version. We can safely make project-only changes to the source code of this copy.
+
+Specifically, we'll look for the `Runtime/RenderPipeline/HDRenderPipeline.cs` file, and the `OverrideCameraRendering` struct. We'll begin by making it `public` instead of `internal`. Next, we'll note that it has one constructor, taking `CommandBuffer cmd` and `Camera overrideCamera`. We'll add another parameter, `bool matchAspectRatio`. We'll need to re-add the two-parameter constructor, calling the three-parameter version with `matchAspectRatio` as `true`. Finally, in the three-parameter constructor, we'll look for the calls to `overrideHDCamera.OverridePixelRect(...)` and `overrideCamera.aspect`, enclosing them in an `if` statement that checks if `matchAspectRatio` is true.
+
 
 ## Simulation
 
