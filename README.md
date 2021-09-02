@@ -2,6 +2,8 @@
 
 This project implements and explains the process of creating real-time deformable snow using HDRP. It covers shading, deformation, and simulation of snow.
 
+![Hello World](hello.gif)
+
 ## Project Setup
 
 This project was built using Unity 2020.3.6f1 with HDRP 10.4.0 (upgraded from Unity 2019.3.9f1 with HDRP 7.3.1). It relies on HDRP's CustomPass to perform updates for deformation and simulation. All content (scripts, shaders, materials, textures, etc.) can be found under the Assets/Snow folder.
